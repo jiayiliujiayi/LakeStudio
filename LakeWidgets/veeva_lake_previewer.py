@@ -1,28 +1,7 @@
 import os
 import pandas as pd
-import snowflake.connector
 import streamlit as st
-
-
-@st.cache_resource(ttl=3600)
-def _get_cached_snowflake_connection(user_id: str, database: str, schema: str):
-    """
-    Caches the Snowflake connection object in Streamlit memory for 1 hour.
-    Triggers Okta/SSO browser prompt ONLY ONCE per session.
-    """
-    print(f"⚡ Establishing single cached Snowflake connection for {user_id}...")
-    conn = snowflake.connector.connect(
-        user=user_id,
-        account="colgatepalmoliveprod.us-central1.gcp",
-        authenticator="externalbrowser",
-    )
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"USE DATABASE {database}")
-        cursor.execute(f"USE SCHEMA {schema}")
-    finally:
-        cursor.close()
-    return conn
+from LakeWidgets.auth_utils import get_snowflake_connection
 
 
 class VeevaLakePreviewer:
@@ -39,24 +18,22 @@ class VeevaLakePreviewer:
         self.conn = None
 
     def connect(self):
-        """Retrieves or reuses the cached Snowflake session."""
-        self.conn = _get_cached_snowflake_connection(
+        """Retrieves or creates the universal cached Snowflake connection."""
+        self.conn = get_snowflake_connection(
             user_id=self.user_id,
             database=self.database,
-            schema=self.schema
+            schema=self.schema,
         )
         return self.conn
 
     def _ensure_connection(self):
-        """Internal helper to guarantee connection state."""
+        """Internal helper to ensure active connection before execution."""
         if self.conn is None or self.conn.is_closed():
             self.connect()
 
-    @st.cache_data(ttl=1800, show_spinner="Fetching table list from Snowflake...")
+    @st.cache_data(ttl=1800, show_spinner="Fetching table metadata from Snowflake...")
     def fetch_available_tables(_self) -> list:
-        """
-        Fetches and caches active table names from INFORMATION_SCHEMA for 30 mins.
-        """
+        """Fetches active base tables from INFORMATION_SCHEMA."""
         _self._ensure_connection()
 
         query = f"""
@@ -75,14 +52,10 @@ class VeevaLakePreviewer:
             cur.close()
 
     def fetch_table_preview(self, table_name: str, limit: int = 100) -> pd.DataFrame:
-        """
-        Fetches a fast preview of the target table. 
-        Defaults to 100 rows to ensure rapid local response times.
-        """
+        """Fetches table preview with server-side row limit."""
         self._ensure_connection()
 
-        # Enforce server-side limit for speed
-        limit_clause = f"LIMIT {limit}" if limit else "LIMIT 500"
+        limit_clause = f"LIMIT {limit}" if limit is not None else "LIMIT 500"
         query = f"SELECT * FROM {self.database}.{self.schema}.{table_name} {limit_clause};"
 
         cur = self.conn.cursor()
