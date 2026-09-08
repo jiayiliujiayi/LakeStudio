@@ -3,3 +3,4 @@ pandas
 numpy
 snowflake-connector-python
 plotly
+streamlit-aggrid
