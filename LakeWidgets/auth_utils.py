@@ -1,4 +1,5 @@
 import os
+import re
 import snowflake.connector
 import streamlit as st
 
@@ -13,8 +14,20 @@ def is_streamlit_cloud() -> bool:
 
 
 @st.cache_resource(ttl=3600)
-def _connect_snowflake_oauth(user_id: str, token: str, database: str, schema: str):
-    """Cached connection helper for OAuth Tokens."""
+def _connect_snowflake_sso_direct(user_id: str, database: str, schema: str):
+    """Cached connection for local desktop where localhost redirect works automatically."""
+    return snowflake.connector.connect(
+        user=user_id,
+        account=SNOWFLAKE_ACCOUNT,
+        authenticator="externalbrowser",
+        database=database,
+        schema=schema,
+    )
+
+
+@st.cache_resource(ttl=3600)
+def _connect_snowflake_via_token(user_id: str, token: str, database: str, schema: str):
+    """Cached connection using extracted SAML/SSO authorization token."""
     return snowflake.connector.connect(
         user=user_id,
         account=SNOWFLAKE_ACCOUNT,
@@ -26,86 +39,55 @@ def _connect_snowflake_oauth(user_id: str, token: str, database: str, schema: st
     )
 
 
-@st.cache_resource(ttl=3600)
-def _connect_snowflake_pat(user_id: str, pat_token: str, database: str, schema: str):
-    """Cached connection helper for Programmatic Access Tokens (PAT) / Passwords."""
-    return snowflake.connector.connect(
-        user=user_id,
-        password=pat_token,
-        account=SNOWFLAKE_ACCOUNT,
-        warehouse="GTED_WH",
-        database=database,
-        schema=schema,
-    )
-
-
-@st.cache_resource(ttl=3600)
-def _connect_snowflake_sso(user_id: str, database: str, schema: str):
-    """Cached connection helper for Local SSO."""
-    return snowflake.connector.connect(
-        user=user_id,
-        account=SNOWFLAKE_ACCOUNT,
-        authenticator="externalbrowser",
-        database=database,
-        schema=schema,
-    )
-
-
 def get_snowflake_connection(
     user_id: str,
     database: str = DEFAULT_DATABASE,
     schema: str = DEFAULT_SCHEMA,
 ):
     """
-    Main authentication router (No @st.cache_resource on this function to allow UI widgets).
+    Main authentication router with manual localhost URL parsing for Streamlit Cloud.
     """
-    # 1. Streamlit Secrets (Cloud setup)
-    if "snowflake" in st.secrets:
-        sec = st.secrets["snowflake"]
-        try:
-            if "token" in sec:
-                return _connect_snowflake_oauth(
-                    sec.get("user", user_id), sec["token"], database, schema
-                )
-            elif "password" in sec:
-                return _connect_snowflake_pat(
-                    sec.get("user", user_id), sec["password"], database, schema
-                )
-        except Exception as e:
-            st.error(f"❌ Connection failed using Streamlit secrets: {e}")
-
-    # 2. Local Desktop SSO Execution
+    # 1. Local Desktop Execution: Try direct automatic browser SSO
     if not is_streamlit_cloud():
         try:
-            return _connect_snowflake_sso(user_id, database, schema)
+            return _connect_snowflake_sso_direct(user_id, database, schema)
         except Exception as e:
-            st.warning(f"Browser SSO failed: {e}")
+            st.warning(f"Automatic browser SSO failed: {e}")
 
-    # 3. Streamlit Cloud UI Fallback (Prompt Outside Cache)
-    st.warning("🌐 **Browser SSO unavailable in Streamlit Cloud environment.**")
-    
-    auth_type = st.radio(
-        "Select Authentication Method:",
-        ["Programmatic Access Token (PAT) / Password", "OAuth Token"],
-        key="cloud_auth_type"
+    # 2. Streamlit Cloud / Headless Execution
+    st.info("🔐 **Snowflake SSO Authorization Required**")
+    st.markdown(
+        """
+        **Instructions to complete authentication:**
+        1. Open your browser and complete your Okta / Single Sign-On authentication if prompted.
+        2. When Okta finishes, your browser will try to navigate to a URL starting with `http://localhost:43477/...` (or a similar port) and fail to load.
+        3. **Copy the full `http://localhost:...` address** from your browser's address bar and paste it below.
+        """
     )
 
-    token_input = st.text_input(
-        f"Enter your Snowflake {auth_type}:",
-        type="password",
-        key="cloud_user_token_input"
+    redirect_url = st.text_input(
+        "Paste the full redirected 'http://localhost:...' URL here:",
+        type="default",
+        key="sso_redirect_url_input",
+        placeholder="http://localhost:43477/?token=..."
     )
 
-    if token_input:
-        try:
-            if "OAuth" in auth_type:
-                conn = _connect_snowflake_oauth(user_id, token_input, database, schema)
-            else:
-                conn = _connect_snowflake_pat(user_id, token_input, database, schema)
-            st.success("✅ Connected successfully!")
-            return conn
-        except Exception as err:
-            st.error(f"❌ Failed to connect: {err}")
+    if redirect_url:
+        # Extract token parameter from pasted URL
+        token_match = re.search(r"[?&]token=([^&]+)", redirect_url)
+        if token_match:
+            extracted_token = token_match.group(1)
+            try:
+                conn = _connect_snowflake_via_token(
+                    user_id, extracted_token, database, schema
+                )
+                st.success("✅ Successfully authenticated!")
+                return conn
+            except Exception as err:
+                st.error(f"❌ Connection failed with provided token: {err}")
+                st.stop()
+        else:
+            st.error("❌ Invalid URL format. Could not locate `token=` parameter in the pasted address.")
             st.stop()
     else:
         st.stop()
