@@ -8,78 +8,104 @@ SNOWFLAKE_ACCOUNT = "colgatepalmoliveprod.us-central1.gcp"
 
 
 def is_streamlit_cloud() -> bool:
-    """Detects if the application is running in Streamlit Cloud / headless server."""
+    """Detects if running in Streamlit Cloud / headless environment."""
     return os.getenv("STREAMLIT_SERVER_HEADLESS", "false").lower() == "true" or not os.getenv("DISPLAY", "")
 
 
 @st.cache_resource(ttl=3600)
+def _connect_snowflake_oauth(user_id: str, token: str, database: str, schema: str):
+    """Cached connection helper for OAuth Tokens."""
+    return snowflake.connector.connect(
+        user=user_id,
+        account=SNOWFLAKE_ACCOUNT,
+        authenticator="oauth",
+        token=token,
+        warehouse="GTED_WH",
+        database=database,
+        schema=schema,
+    )
+
+
+@st.cache_resource(ttl=3600)
+def _connect_snowflake_pat(user_id: str, pat_token: str, database: str, schema: str):
+    """Cached connection helper for Programmatic Access Tokens (PAT) / Passwords."""
+    return snowflake.connector.connect(
+        user=user_id,
+        password=pat_token,
+        account=SNOWFLAKE_ACCOUNT,
+        warehouse="GTED_WH",
+        database=database,
+        schema=schema,
+    )
+
+
+@st.cache_resource(ttl=3600)
+def _connect_snowflake_sso(user_id: str, database: str, schema: str):
+    """Cached connection helper for Local SSO."""
+    return snowflake.connector.connect(
+        user=user_id,
+        account=SNOWFLAKE_ACCOUNT,
+        authenticator="externalbrowser",
+        database=database,
+        schema=schema,
+    )
+
+
 def get_snowflake_connection(
     user_id: str,
     database: str = DEFAULT_DATABASE,
     schema: str = DEFAULT_SCHEMA,
 ):
     """
-    Universal Snowflake Connection Helper:
-    1. Uses Streamlit Secrets (PAT / OAuth / Key-Pair) if configured.
-    2. Uses Local Browser SSO if running locally.
-    3. Prompts for Programmatic Access Token (PAT) if running in Streamlit Cloud / Headless mode.
+    Main authentication router (No @st.cache_resource on this function to allow UI widgets).
     """
-    # Path 1: Streamlit Secrets configured in App Settings (Best for persistent cloud setup)
-    if "snowflake" in st.secrets and "token" in st.secrets["snowflake"]:
+    # 1. Streamlit Secrets (Cloud setup)
+    if "snowflake" in st.secrets:
+        sec = st.secrets["snowflake"]
         try:
-            return snowflake.connector.connect(
-                user=st.secrets["snowflake"].get("user", user_id),
-                account=SNOWFLAKE_ACCOUNT,
-                authenticator="oauth",
-                token=st.secrets["snowflake"]["token"],
-                warehouse=st.secrets["snowflake"].get("warehouse", "GTED_WH"),
-                database=database,
-                schema=schema,
-            )
+            if "token" in sec:
+                return _connect_snowflake_oauth(
+                    sec.get("user", user_id), sec["token"], database, schema
+                )
+            elif "password" in sec:
+                return _connect_snowflake_pat(
+                    sec.get("user", user_id), sec["password"], database, schema
+                )
         except Exception as e:
-            st.error(f"❌ Connection failed using secret token: {e}")
+            st.error(f"❌ Connection failed using Streamlit secrets: {e}")
 
-    # Path 2: Local Desktop Execution (Browser popup supported)
+    # 2. Local Desktop SSO Execution
     if not is_streamlit_cloud():
         try:
-            return snowflake.connector.connect(
-                user=user_id,
-                account=SNOWFLAKE_ACCOUNT,
-                authenticator="externalbrowser",
-                database=database,
-                schema=schema,
-            )
+            return _connect_snowflake_sso(user_id, database, schema)
         except Exception as e:
-            st.warning(f"Browser SSO failed locally. Falling back to Token Prompt: {e}")
+            st.warning(f"Browser SSO failed: {e}")
 
-    # Path 3: Headless / Streamlit Cloud — Prompt user for Programmatic Access Token (PAT)
-    st.warning("🌐 **Browser SSO automatically unavailable in Streamlit Cloud environment.**")
-    st.info(
-        "To authenticate, please provide a **Snowflake Programmatic Access Token (PAT)** or OAuth token."
+    # 3. Streamlit Cloud UI Fallback (Prompt Outside Cache)
+    st.warning("🌐 **Browser SSO unavailable in Streamlit Cloud environment.**")
+    
+    auth_type = st.radio(
+        "Select Authentication Method:",
+        ["Programmatic Access Token (PAT) / Password", "OAuth Token"],
+        key="cloud_auth_type"
     )
 
-    pat_token = st.text_input(
-        "Enter your Snowflake Programmatic Access Token:",
+    token_input = st.text_input(
+        f"Enter your Snowflake {auth_type}:",
         type="password",
-        help="Generate this token from your Snowflake Account Settings or OAuth provider.",
-        key="user_pat_token_input",
+        key="cloud_user_token_input"
     )
 
-    if pat_token:
+    if token_input:
         try:
-            conn = snowflake.connector.connect(
-                user=user_id,
-                account=SNOWFLAKE_ACCOUNT,
-                authenticator="oauth",
-                token=pat_token,
-                warehouse="GTED_WH",
-                database=database,
-                schema=schema,
-            )
-            st.success("✅ Successfully connected to Snowflake!")
+            if "OAuth" in auth_type:
+                conn = _connect_snowflake_oauth(user_id, token_input, database, schema)
+            else:
+                conn = _connect_snowflake_pat(user_id, token_input, database, schema)
+            st.success("✅ Connected successfully!")
             return conn
         except Exception as err:
-            st.error(f"❌ Failed to connect with provided token: {err}")
+            st.error(f"❌ Failed to connect: {err}")
             st.stop()
     else:
         st.stop()
