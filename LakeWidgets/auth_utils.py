@@ -1,14 +1,25 @@
-import io
 import os
-import sys
 import webbrowser
 import snowflake.connector
+from snowflake.connector.auth_webbrowser import AuthByWebBrowser
 import streamlit as st
 
-# Central database and schema definitions
 DEFAULT_DATABASE = "PROD_GTED_HUB"
 DEFAULT_SCHEMA = "CUR_CLIN_VEEVA_CTMS"
 SNOWFLAKE_ACCOUNT = "colgatepalmoliveprod.us-central1.gcp"
+
+
+def _is_headless_environment() -> bool:
+    """Detects if running in Streamlit Cloud, Docker, or a headless server."""
+    if os.environ.get("STREAMLIT_SERVER_PORT") is not None:
+        # Check if GUI web browser can be initialized
+        try:
+            browser = webbrowser.get()
+            if hasattr(browser, "name") and browser.name in ("www-browser", "lynx", "links"):
+                return True
+        except Exception:
+            return True
+    return False
 
 
 @st.cache_resource(ttl=3600)
@@ -18,56 +29,67 @@ def get_snowflake_connection(
     schema: str = DEFAULT_SCHEMA,
 ):
     """
-    Universal cached Snowflake connection helper for all LakeStudio modules.
-    - Reuses an active connection for 1 hour across all widgets.
-    - Automatically launches a browser locally.
-    - Renders a clickable SSO link in Streamlit UI if browser popup fails (cloud/headless).
+    Universal cached Snowflake connection helper.
+    - Local Desktop: Launches browser SSO pop-up automatically.
+    - Streamlit Cloud: Intercepts SSO redirect URL and displays clickable UI link + input field.
     """
     print(f"⚡ [LakeStudio Auth] Initializing Snowflake session for {user_id}...")
 
-    # Detect if local environment supports opening a desktop browser
-    can_open_browser = True
+    # Check if Streamlit Cloud Secrets has service account credentials configured
+    if "snowflake" in st.secrets:
+        conn = snowflake.connector.connect(
+            user=st.secrets["snowflake"].get("user", user_id),
+            password=st.secrets["snowflake"]["password"],
+            account=st.secrets["snowflake"].get("account", SNOWFLAKE_ACCOUNT),
+            warehouse=st.secrets["snowflake"].get("warehouse", "GTED_WH"),
+            database=database,
+            schema=schema,
+        )
+        return conn
+
+    # Desktop / Interactive SSO Browser Auth
     try:
-        browser = webbrowser.get()
-        if hasattr(browser, "name") and browser.name in ("www-browser", "lynx", "links"):
-            can_open_browser = False
-    except Exception:
-        can_open_browser = False
-
-    # Redirect stdout to capture the login URL emitted by snowflake.connector
-    captured_output = io.StringIO()
-    original_stdout = sys.stdout
-
-    try:
-        if not can_open_browser:
-            sys.stdout = captured_output
-
         conn = snowflake.connector.connect(
             user=user_id,
             account=SNOWFLAKE_ACCOUNT,
             authenticator="externalbrowser",
+            database=database,
+            schema=schema,
         )
+        return conn
     except Exception as err:
-        output_text = captured_output.getvalue()
+        # If external browser failed in cloud/headless mode, render manual link UI
+        st.error("🔒 **Snowflake SSO Authentication Required**")
+        st.info(
+            "Automatic browser pop-ups are unavailable in hosted cloud environments. "
+            "Please authenticate using your corporate Okta/SSO credentials below."
+        )
 
-        # Extract URL if generated during authentication prompt
-        if "https://" in output_text:
-            url_start = output_text.find("https://")
-            url = output_text[url_start:].split()[0]
-            st.error("🔒 **SSO Authentication Required**")
-            st.markdown(
-                f"Automatic browser pop-up is unavailable in this environment.\n\n"
-                f"👉 **[Click here to authenticate with Colgate SSO]({url})**"
+        try:
+            # Instantiate web browser authenticator manually to extract SSO URL
+            authenticator = AuthByWebBrowser(
+                application="LakeStudio",
+                webbrowser_pkg=webbrowser,
             )
-        raise ConnectionError(f"Snowflake SSO Authentication failed: {str(err)}")
-    finally:
-        sys.stdout = original_stdout
+            # Generate SAML request URL
+            sso_url = authenticator.get_sso_url(
+                account=SNOWFLAKE_ACCOUNT,
+                user=user_id,
+                authenticator="externalbrowser",
+            )
+            
+            if sso_url:
+                st.markdown(f"### 👉 **[Click Here to Authenticate with Colgate SSO]({sso_url})**")
+                st.caption(
+                    "After authenticating in the new tab, copy the final redirected URL from your browser address bar and paste it below."
+                )
+                
+                redirect_url = st.text_input("Paste Redirected SAML URL here:", key="sso_redirect_url_input")
+                if redirect_url:
+                    # Authenticate session using returned SAML response token
+                    conn = authenticator.authenticate(redirect_url)
+                    return conn
+        except Exception as sso_err:
+            st.warning(f"Could not automatically generate SSO URL: {str(sso_err)}")
 
-    cursor = conn.cursor()
-    try:
-        cursor.execute(f"USE DATABASE {database}")
-        cursor.execute(f"USE SCHEMA {schema}")
-    finally:
-        cursor.close()
-
-    return conn
+        raise ConnectionError(f"Snowflake Authentication Failed: {str(err)}")
