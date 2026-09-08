@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse
 import snowflake.connector
 import streamlit as st
 
@@ -13,9 +14,20 @@ def is_streamlit_cloud() -> bool:
     return os.getenv("STREAMLIT_SERVER_HEADLESS", "false").lower() == "true" or not os.getenv("DISPLAY", "")
 
 
+def build_snowflake_sso_url(user_id: str) -> str:
+    """Constructs the Okta/SAML SSO authorization URL for Snowflake."""
+    # Formats the standard Snowflake SAML initiation endpoint
+    base_account = SNOWFLAKE_ACCOUNT.replace(".", "-")
+    sso_url = (
+        f"https://{base_account}.snowflakecomputing.com/console/login?"
+        f"login_name={urllib.parse.quote(user_id)}&authenticator=externalbrowser"
+    )
+    return sso_url
+
+
 @st.cache_resource(ttl=3600)
 def _connect_snowflake_sso_direct(user_id: str, database: str, schema: str):
-    """Cached connection for local desktop where localhost redirect works automatically."""
+    """Cached connection for local desktop where browser popup works automatically."""
     return snowflake.connector.connect(
         user=user_id,
         account=SNOWFLAKE_ACCOUNT,
@@ -45,23 +57,37 @@ def get_snowflake_connection(
     schema: str = DEFAULT_SCHEMA,
 ):
     """
-    Main authentication router with manual localhost URL parsing for Streamlit Cloud.
+    Universal auth router:
+    - If running locally: Automatically triggers browser pop-up.
+    - If running on Streamlit Cloud: Displays clickable SSO login button + token listener.
     """
-    # 1. Local Desktop Execution: Try direct automatic browser SSO
+    # 1. Local Desktop Execution: Automatically launch browser popup
     if not is_streamlit_cloud():
         try:
             return _connect_snowflake_sso_direct(user_id, database, schema)
         except Exception as e:
-            st.warning(f"Automatic browser SSO failed: {e}")
+            st.warning(f"Local browser popup failed, switching to cloud workflow: {e}")
 
-    # 2. Streamlit Cloud / Headless Execution
-    st.info("🔐 **Snowflake SSO Authorization Required**")
+    # 2. Streamlit Cloud / Headless Execution Flow
+    st.info("🔐 **Snowflake SSO Authentication Required**")
+    
+    sso_link = build_snowflake_sso_url(user_id)
+
+    st.markdown(
+        f"""
+        ### Step 1: Log in with Okta
+        Click the button below to complete Single Sign-On in a new tab:
+        
+        [👉 **Click Here to Open Okta / Snowflake Login**]({sso_link})
+        """
+    )
+
     st.markdown(
         """
-        **Instructions to complete authentication:**
-        1. Open your browser and complete your Okta / Single Sign-On authentication if prompted.
-        2. When Okta finishes, your browser will try to navigate to a URL starting with `http://localhost:43477/...` (or a similar port) and fail to load.
-        3. **Copy the full `http://localhost:...` address** from your browser's address bar and paste it below.
+        ### Step 2: Complete Connection
+        1. After authenticating in Okta, your browser will try to open a page starting with `http://localhost:43477/...` (or a similar port) and display an error page (e.g. *"This site can’t be reached"*).
+        2. **Copy the full `http://localhost:...` URL** from your browser's address bar.
+        3. **Paste the URL below** to sign in:
         """
     )
 
@@ -81,7 +107,7 @@ def get_snowflake_connection(
                 conn = _connect_snowflake_via_token(
                     user_id, extracted_token, database, schema
                 )
-                st.success("✅ Successfully authenticated!")
+                st.success("✅ Successfully connected to Snowflake!")
                 return conn
             except Exception as err:
                 st.error(f"❌ Connection failed with provided token: {err}")
